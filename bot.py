@@ -30,6 +30,9 @@ MAIN_LOOP: asyncio.AbstractEventLoop | None = None   # главный event loop
 
 SUPPORT_URL="https://t.me/bexruz2281488"
 
+# кэш последней цены исполнения по символу (для fallback номинала)
+LAST_EXEC_PRICE: dict[str, Decimal] = {}
+
 # ------------------ форматтеры чисел ------------------
 
 def _to_decimal(val):
@@ -83,7 +86,7 @@ def fmt_lev(val) -> str | None:
     return None
 
 def line(caption: str, value) -> str:
-    """Вернуть 'Ключ: Значение\\n' или пустую строку, если value пустое."""
+    """Вернуть 'Ключ: Значение\n' или пустую строку, если value пустое."""
     return f"{caption}: {value}\n" if value not in (None, "", "—") else ""
 
 def notional_from_row(row: dict) -> tuple[Decimal | None, bool]:
@@ -186,14 +189,20 @@ async def queue_consumer(app:Application,http:HTTP):
             if topic=="position":
                 await on_position(app,msg)
             elif topic=="execution":
-                # при исполнении ордеров догружаем точный срез по символам
+                # запоминаем последнюю execPrice по символам (для fallback номинала)
                 try:
-                    data=msg.get("data",[])
-                    if isinstance(data,dict): data=[data]
-                    symbols=set()
+                    data = msg.get("data", [])
+                    if isinstance(data, dict):
+                        data = [data]
+                    symbols = set()
                     for r in data:
-                        s=r.get("symbol")
-                        if s: symbols.add(s)
+                        s = r.get("symbol")
+                        p = _to_decimal(r.get("execPrice") or r.get("price"))
+                        if s and p:
+                            LAST_EXEC_PRICE[s] = p
+                        if s:
+                            symbols.add(s)
+                    # при исполнении ордеров догружаем точный срез по символам (если HTTP доступен)
                     for s in symbols:
                         await fetch_symbol_and_process(app,http,s)
                 except Exception as e:
@@ -241,6 +250,14 @@ async def on_position(app:Application,msg:dict):
 
             # Номинал: positionValue -> size*avg -> size*mark (≈)
             nt_val, approx = notional_from_row(r)
+
+            # Доп. fallback: если HTTP/mark/avg недоступны, считаем по последней цене исполнения из WS
+            if nt_val is None:
+                lp = LAST_EXEC_PRICE.get(symbol)
+                if lp:
+                    nt_val = (abs(size) * lp).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                    approx = True
+
             nt_str = fmt_usd(nt_val)
             nt_str = f"≈ {nt_str}" if nt_str and approx else nt_str
 
