@@ -1,5 +1,6 @@
 import os, asyncio, time, uuid, logging
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from datetime import datetime, timedelta, timezone as dt_tz
 from dotenv import load_dotenv
 from pybit.unified_trading import WebSocket, HTTP
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,6 +16,7 @@ MONGO_URI=os.getenv("MONGO_URI","")
 DB_NAME=os.getenv("DB_NAME","bybit_bot")
 BYBIT_SETTLE=os.getenv("BYBIT_SETTLE","USDT").upper()
 LOG_LEVEL=os.getenv("LOG_LEVEL","INFO").upper()
+STATS_TZ_HOURS=int(os.getenv("STATS_TZ_HOURS","3"))  # смещение для суточной статы (по умолчанию МСК)
 
 logging.basicConfig(level=getattr(logging,LOG_LEVEL,logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(message)s")
@@ -185,22 +187,85 @@ async def on_toggle(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=kb(True))
         await q.message.reply_text("Сигналы включены. Буду присылать уведомления о сделках мастера.", reply_markup=kb(True))
 
+# ======= НОВОЕ: суточная статистика закрытых сделок =======
+
+def _fmt_price_usdt(p: Decimal | None) -> str:
+    s = fmt_price(p)
+    return f"{s} USDT" if s else "—"
+
+def _deal_dir(side_str: str) -> str:
+    return "Long" if (side_str or "").upper() == "BUY" else "Short"
+
+async def _build_daily_stats_text(tz_hours: int = 3) -> str:
+    """Сводка закрытых сделок за текущие сутки локального дня (по tz_hours)."""
+    tz = dt_tz(timedelta(hours=tz_hours))
+    now_local = datetime.now(tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    start_ts_utc = int(start_local.astimezone(dt_tz.utc).timestamp())
+    end_ts_utc   = int(end_local.astimezone(dt_tz.utc).timestamp())
+
+    cur = coll_deals.find({
+        "status": "closed",
+        "end_ts": {"$gte": start_ts_utc, "$lt": end_ts_utc}
+    }).sort("end_ts", 1)
+
+    deals = await cur.to_list(length=200)
+    if not deals:
+        return "🟢 Статистика закрытых сделок за сутки:\n\nНет закрытых сделок."
+
+    lines = ["🟢 Статистика закрытых сделок за сутки:\n"]
+    total_pnl = Decimal("0")
+    idx = 0
+    for d in deals:
+        symbol = d.get("symbol","UNKNOWN")
+        dir_   = _deal_dir(d.get("side",""))
+        buy_q  = _to_decimal(d.get("buy_qty",0))  or Decimal("0")
+        sell_q = _to_decimal(d.get("sell_qty",0)) or Decimal("0")
+        buy_v  = _to_decimal(d.get("buy_val",0))  or Decimal("0")
+        sell_v = _to_decimal(d.get("sell_val",0)) or Decimal("0")
+        fees   = _to_decimal(d.get("fees",0))     or Decimal("0")
+        pnl    = _to_decimal(d.get("pnl")) if d.get("pnl") is not None else (sell_v - buy_v - fees)
+        pnl    = (pnl or Decimal("0")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        total_pnl += pnl
+
+        # объём и цены входа/выхода
+        if dir_ == "Long":
+            size = buy_q if buy_q > 0 else sell_q
+            entry = (buy_v / buy_q) if buy_q > 0 else None
+            exitp = (sell_v / sell_q) if sell_q > 0 else None
+            type_str = "Buy (лонг)"
+        else:
+            size = sell_q if sell_q > 0 else buy_q
+            entry = (sell_v / sell_q) if sell_q > 0 else None
+            exitp = (buy_v / buy_q) if buy_q > 0 else None
+            type_str = "Sell (шорт)"
+
+        idx += 1
+        lines += [
+            f"{idx} {symbol}",
+            f"• Тип: {type_str}",
+            f"• Кол-во: {fmt_qty(size)}",
+            f"• Цена входа: {_fmt_price_usdt(entry)}",
+            f"• Цена выхода: {_fmt_price_usdt(exitp)}",
+            f"• {'Прибыль' if pnl>=0 else 'Убыток'} (PnL): {fmt_usd_signed(pnl)}",
+            ""
+        ]
+
+    lines += [
+        "— Итого по закрытым сделкам:",
+        f"• Сделок: {idx}",
+        f"• Общий PnL: {fmt_usd_signed(total_pnl)}"
+    ]
+    return "\n".join(lines)
+
 async def on_stats(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    """Кнопка 📊 — суточная сводка закрытых сделок (локальный день)."""
     q = update.callback_query
     await q.answer()
-    cursor = coll_deals.find({"status":"closed"}).sort("end_ts",-1).limit(10)
-    rows = await cursor.to_list(length=10)
-    if not rows:
-        await q.message.reply_text("Пока нет закрытых сделок.", reply_markup=kb(True))
-        return
-    lines=[]; total=Decimal("0")
-    for d in rows:
-        sym=d.get("symbol","?"); side=d.get("side","?")
-        pnl=_to_decimal(d.get("pnl",0)) or Decimal("0")
-        total += pnl
-        lines.append(f"{sym} / {side} / {fmt_usd_signed(pnl)}")
-    await q.message.reply_text("📊 Последние сделки (до 10):\n" + "\n".join(lines) +
-                               f"\n\nИтого PnL: {fmt_usd_signed(total)}", reply_markup=kb(True))
+    text = await _build_daily_stats_text(STATS_TZ_HOURS)
+    # отправляем отдельным сообщением (не редактируем старое), чтобы не ломать клавиатуру
+    await q.message.reply_text(text, reply_markup=kb(True))
 
 # ------------------ helpers ------------------
 
