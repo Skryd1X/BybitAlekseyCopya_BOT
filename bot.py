@@ -21,16 +21,19 @@ logging.basicConfig(level=getattr(logging,LOG_LEVEL,logging.INFO),
 
 msg_queue:asyncio.Queue=asyncio.Queue()
 deal_seq=80000
+
 db=None
 coll_pos=None
 coll_ev=None
 coll_cfg=None
 coll_subs=None
-MAIN_LOOP: asyncio.AbstractEventLoop | None = None   # главный event loop
+coll_deals=None            # <— учёт сделок/PNL
+
+MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
 SUPPORT_URL="https://t.me/bexruz2281488"
 
-# кэш последней цены исполнения по символу (для fallback номинала)
+# кэш последних цен исполнений (для номинала-«фоллбэка»)
 LAST_EXEC_PRICE: dict[str, Decimal] = {}
 
 # ------------------ форматтеры чисел ------------------
@@ -44,11 +47,10 @@ def _to_decimal(val):
         return None
 
 def fmt_qty(val, max_dec: int = 6) -> str:
-    """Количество/размер без экспоненты и с обрезкой лишних нулей"""
     d = _to_decimal(val)
     if not d:
         return "0"
-    s = f"{d.normalize():f}"  # убираем экспоненту
+    s = f"{d.normalize():f}"
     if "." in s:
         i, f = s.split(".")
         f = f.rstrip("0")[:max_dec]
@@ -56,11 +58,9 @@ def fmt_qty(val, max_dec: int = 6) -> str:
     return s
 
 def fmt_price(val) -> str | None:
-    """Цена с динамической точностью. None -> не выводим строку."""
     d = _to_decimal(val)
     if not d or d == 0:
         return None
-    # динамическая точность: чем меньше цена, тем больше знаков
     dec = 2 if d >= 1 else 4 if d >= Decimal("0.1") else 6
     q = Decimal(10) ** -dec
     return f"{d.quantize(q, rounding=ROUND_DOWN):f}"
@@ -71,12 +71,18 @@ def fmt_usd(val) -> str | None:
         return None
     return f"${d:,.2f}".replace(",", " ")
 
+def fmt_usd_signed(val) -> str | None:
+    d = _to_decimal(val)
+    if d is None:
+        return None
+    s = "-" if d < 0 else ""
+    return f"{s}${abs(d):,.2f}".replace(",", " ")
+
 def fmt_pct(val) -> str:
     d = _to_decimal(val) or Decimal("0")
     return f"{d.quantize(Decimal('0.01'), rounding=ROUND_DOWN):f}"
 
 def fmt_lev(val) -> str | None:
-    """Плечо: xN, если N>0. Иначе скрываем."""
     d = _to_decimal(val)
     if d and d > 0:
         try:
@@ -86,13 +92,11 @@ def fmt_lev(val) -> str | None:
     return None
 
 def line(caption: str, value) -> str:
-    """Вернуть 'Ключ: Значение\n' или пустую строку, если value пустое."""
     return f"{caption}: {value}\n" if value not in (None, "", "—") else ""
 
 def notional_from_row(row: dict) -> tuple[Decimal | None, bool]:
     """
     Возвращает (номинал, approx_flag).
-    approx_flag=True, если это приблизительный расчёт (без positionValue).
     Приоритет:
       1) positionValue
       2) |size| * avgPrice
@@ -115,12 +119,21 @@ def notional_from_row(row: dict) -> tuple[Decimal | None, bool]:
 
     return None, False
 
+async def _wait_exec_notional(symbol: str, size: Decimal, tries: int = 5, delay: float = 0.2):
+    for _ in range(tries):
+        p = LAST_EXEC_PRICE.get(symbol)
+        if p:
+            return (abs(size) * p).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        await asyncio.sleep(delay)
+    return None
+
 # ------------------ UI ------------------
 
 def kb(enabled: bool):
     t = "🔕 Отключить сигналы" if enabled else "🔔 Включить сигналы"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆘 Поддержка", url=SUPPORT_URL)],
+        [InlineKeyboardButton("🆘 Поддержка", url=SUPPORT_URL),
+         InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton(t, callback_data=("notify_off" if enabled else "notify_on"))]
     ])
 
@@ -179,6 +192,27 @@ async def on_toggle(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=kb(True))
         await q.message.reply_text("Сигналы включены. Буду присылать уведомления о сделках мастера.", reply_markup=kb(True))
 
+async def on_stats(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    """Кнопка 📊 Статистика"""
+    q = update.callback_query
+    await q.answer()
+    # последние 10 закрытых сделок
+    cursor = coll_deals.find({"status":"closed"}).sort("end_ts",-1).limit(10)
+    rows = await cursor.to_list(length=10)
+    if not rows:
+        await q.message.reply_text("Пока нет закрытых сделок.", reply_markup=kb(True))
+        return
+    lines=[]
+    total=Decimal("0")
+    for d in rows:
+        sym=d.get("symbol","?")
+        side=d.get("side","?")
+        pnl=_to_decimal(d.get("pnl",0)) or Decimal("0")
+        total += pnl
+        lines.append(f"{sym} / {side} / {fmt_usd_signed(pnl)}")
+    text = "📊 Последние сделки (до 10):\n" + "\n".join(lines) + "\n\n" + f"Итого PnL: {fmt_usd_signed(total)}"
+    await q.message.reply_text(text, reply_markup=kb(True))
+
 # ------------------ обработка очереди ------------------
 
 async def queue_consumer(app:Application,http:HTTP):
@@ -189,20 +223,46 @@ async def queue_consumer(app:Application,http:HTTP):
             if topic=="position":
                 await on_position(app,msg)
             elif topic=="execution":
-                # запоминаем последнюю execPrice по символам (для fallback номинала)
+                # 1) обновим сделки/PNL из исполнений
                 try:
                     data = msg.get("data", [])
                     if isinstance(data, dict):
                         data = [data]
-                    symbols = set()
+                    symbols=set()
                     for r in data:
-                        s = r.get("symbol")
-                        p = _to_decimal(r.get("execPrice") or r.get("price"))
-                        if s and p:
-                            LAST_EXEC_PRICE[s] = p
-                        if s:
-                            symbols.add(s)
-                    # при исполнении ордеров догружаем точный срез по символам (если HTTP доступен)
+                        sym = r.get("symbol")
+                        if sym: symbols.add(sym)
+                        # вытаскиваем цену и qty
+                        price = (_to_decimal(r.get("execPrice")) or
+                                 _to_decimal(r.get("orderPrice")) or
+                                 _to_decimal(r.get("price")))
+                        qty   = (_to_decimal(r.get("execQty")) or
+                                 _to_decimal(r.get("qty")))
+                        side  = str(r.get("side","")).title()  # 'Buy'/'Sell'
+                        if sym and price and qty and qty>0:
+                            LAST_EXEC_PRICE[sym] = price
+                            # найдём активный deal_id по символу
+                            pos = await coll_pos.find_one({"_id":sym})
+                            deal_id = int((pos or {}).get("deal",0))
+                            if deal_id:
+                                doc = await coll_deals.find_one({"deal":deal_id})
+                                if not doc:
+                                    # если по каким-то причинам не создали на open — создадим «на лету»
+                                    await coll_deals.insert_one({
+                                        "deal": deal_id, "symbol": sym, "side": (pos or {}).get("side",""),
+                                        "start_ts": int(time.time()),
+                                        "buy_qty": 0.0, "buy_val": 0.0,
+                                        "sell_qty": 0.0, "sell_val": 0.0,
+                                        "status": "open"
+                                    })
+                                incs={}
+                                if side=="Buy":
+                                    incs={"buy_qty": float(qty), "buy_val": float(qty*price)}
+                                elif side=="Sell":
+                                    incs={"sell_qty": float(qty), "sell_val": float(qty*price)}
+                                if incs:
+                                    await coll_deals.update_one({"deal":deal_id},{"$inc":incs})
+                    # 2) как и раньше — подтянем позиции для символов
                     for s in symbols:
                         await fetch_symbol_and_process(app,http,s)
                 except Exception as e:
@@ -248,18 +308,25 @@ async def on_position(app:Application,msg:dict):
                 "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
             }},upsert=True)
 
-            # Номинал: positionValue -> size*avg -> size*mark (≈)
+            # создадим объект сделки
+            await coll_deals.insert_one({
+                "deal": int(deal_seq),
+                "symbol": symbol,
+                "side": side,
+                "start_ts": int(time.time()),
+                "buy_qty": 0.0, "buy_val": 0.0,
+                "sell_qty": 0.0, "sell_val": 0.0,
+                "status": "open"
+            })
+
             nt_val, approx = notional_from_row(r)
-
-            # Доп. fallback: если HTTP/mark/avg недоступны, считаем по последней цене исполнения из WS
             if nt_val is None:
-                lp = LAST_EXEC_PRICE.get(symbol)
-                if lp:
-                    nt_val = (abs(size) * lp).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                    approx = True
-
+                w = await _wait_exec_notional(symbol, size)
+                if w is not None:
+                    nt_val, approx = w, True
             nt_str = fmt_usd(nt_val)
-            nt_str = f"≈ {nt_str}" if nt_str and approx else nt_str
+            if nt_str and approx:
+                nt_str = f"≈ {nt_str}"
 
             txt = (
                 f"Сделка №{deal_seq}\n"
@@ -298,13 +365,28 @@ async def on_position(app:Application,msg:dict):
 
         if closed_full:
             deal_id=int(prev.get("deal",deal_seq+1) or deal_seq+1)
+
+            # финализируем сделку и считаем PnL
+            deal_doc = await coll_deals.find_one({"deal":deal_id})
+            pnl = Decimal("0")
+            if deal_doc:
+                buy_val = _to_decimal(deal_doc.get("buy_val",0)) or Decimal("0")
+                sell_val = _to_decimal(deal_doc.get("sell_val",0)) or Decimal("0")
+                pnl = (sell_val - buy_val).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+                await coll_deals.update_one({"deal":deal_id},{
+                    "$set":{"status":"closed","end_ts":int(time.time()),"pnl":float(pnl)}
+                })
+
             await coll_pos.update_one({"_id":symbol},{"$set":{
                 "size":0.0,"avg":0.0,"side":"","deal":deal_id,"lev":lev
             }},upsert=True)
+
+            pnl_line = line("PNL", fmt_usd_signed(pnl))
             txt=(f"Сделка №{deal_id}\n"
                  f"⬛ Полное закрытие позиции\n\n"
                  f"{prev_side} {symbol}\n"
-                 f"Позиция закрыта полностью")
+                 f"Позиция закрыта полностью\n"
+                 f"{pnl_line}")
             await save_event("close",symbol,prev_side,Decimal("0"),avg,lev,deal_id)
             await broadcast(app,txt)
             continue
@@ -345,12 +427,14 @@ async def post_init(app:Application):
     logging.info("Starting post_init...")
 
     client=AsyncIOMotorClient(MONGO_URI,uuidRepresentation="standard")
-    global db, coll_pos, coll_ev, coll_cfg, coll_subs
+    global db, coll_pos, coll_ev, coll_cfg, coll_subs, coll_deals
     db=client[DB_NAME]
     coll_pos=db["positions"]
     coll_ev=db["events"]
     coll_cfg=db["config"]
     coll_subs=db["subscribers"]
+    coll_deals=db["deals"]           # <— коллекция сделок/PNL
+
     await db.command("ping")
     logging.info("Mongo connected: db=%s", DB_NAME)
 
@@ -364,6 +448,8 @@ async def post_init(app:Application):
     await coll_pos.create_index("side")
     await coll_ev.create_index([("t",1)])
     await coll_subs.create_index("chat_id", unique=True)
+    await coll_deals.create_index([("status",1),("end_ts",-1)])
+    await coll_deals.create_index("deal", unique=True)
     logging.info("Mongo indexes ready")
 
     # стартовый снимок активных позиций по USDT-контрактам
@@ -383,6 +469,11 @@ async def post_init(app:Application):
             deal_seq+=1
             await coll_pos.update_one({"_id":symbol},{"$set":{
                 "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
+            }},upsert=True)
+            # создадим «висящую» сделку для активной позиции
+            await coll_deals.update_one({"deal":int(deal_seq)},{"$setOnInsert":{
+                "deal":int(deal_seq),"symbol":symbol,"side":side,"start_ts":int(time.time()),
+                "buy_qty":0.0,"buy_val":0.0,"sell_qty":0.0,"sell_val":0.0,"status":"open"
             }},upsert=True)
             await save_event("detected",symbol,side,size,avg,lev,deal_seq)
             cnt+=1
@@ -424,6 +515,7 @@ def main():
     )
     app.add_handler(CommandHandler("start",cmd_start))
     app.add_handler(CallbackQueryHandler(on_toggle, pattern="^(notify_on|notify_off)$"))
+    app.add_handler(CallbackQueryHandler(on_stats, pattern="^stats$"))
     app.run_polling(allowed_updates=None, close_loop=False)
 
 if __name__=="__main__":
