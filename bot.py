@@ -83,15 +83,34 @@ def fmt_lev(val) -> str | None:
     return None
 
 def line(caption: str, value) -> str:
-    """Вернуть 'Ключ: Значение\n' или пустую строку, если value пустое."""
+    """Вернуть 'Ключ: Значение\\n' или пустую строку, если value пустое."""
     return f"{caption}: {value}\n" if value not in (None, "", "—") else ""
 
-def notional(avg, size) -> Decimal | None:
-    a = _to_decimal(avg)
-    q = _to_decimal(size)
-    if a and q and a > 0 and q != 0:
-        return (a * abs(q)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-    return None
+def notional_from_row(row: dict) -> tuple[Decimal | None, bool]:
+    """
+    Возвращает (номинал, approx_flag).
+    approx_flag=True, если это приблизительный расчёт (без positionValue).
+    Приоритет:
+      1) positionValue
+      2) |size| * avgPrice
+      3) |size| * markPrice
+    """
+    pv = _to_decimal(row.get("positionValue") or row.get("position_value"))
+    if pv and pv > 0:
+        return pv.quantize(Decimal("0.01"), rounding=ROUND_DOWN), False
+
+    size = _to_decimal(row.get("size"))
+    avg  = _to_decimal(row.get("avgPrice") or row.get("avg_price"))
+    if size and avg and size != 0 and avg > 0:
+        val = (abs(size) * avg).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        return val, True
+
+    mark = _to_decimal(row.get("markPrice") or row.get("mark_price"))
+    if size and mark and size != 0 and mark > 0:
+        val = (abs(size) * mark).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        return val, True
+
+    return None, False
 
 # ------------------ UI ------------------
 
@@ -220,7 +239,10 @@ async def on_position(app:Application,msg:dict):
                 "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
             }},upsert=True)
 
-            nt = notional(avg, size)
+            # Номинал: positionValue -> size*avg -> size*mark (≈)
+            nt_val, approx = notional_from_row(r)
+            nt_str = fmt_usd(nt_val)
+            nt_str = f"≈ {nt_str}" if nt_str and approx else nt_str
 
             txt = (
                 f"Сделка №{deal_seq}\n"
@@ -229,7 +251,7 @@ async def on_position(app:Application,msg:dict):
                 f"Размер: {fmt_qty(size)}\n"
                 f"{line('Плечо', fmt_lev(lev))}"
                 f"{line('Средняя цена входа', fmt_price(avg))}"
-                f"{line('Номинал', fmt_usd(nt))}"
+                f"{line('Номинал', nt_str)}"
             )
             await save_event("open",symbol,side,size,avg,lev,deal_seq)
             await broadcast(app,txt)
@@ -289,7 +311,9 @@ async def fetch_symbol_and_process(app:Application,http:HTTP,symbol:str):
                     "side":x.get("side"),
                     "size":x.get("size"),
                     "avgPrice":x.get("avgPrice"),
-                    "leverage":x.get("leverage")
+                    "leverage":x.get("leverage"),
+                    "markPrice":x.get("markPrice"),
+                    "positionValue":x.get("positionValue")
                 })
         if rows:
             await on_position(app,{"topic":"position","data":rows})
