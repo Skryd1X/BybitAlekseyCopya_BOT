@@ -83,7 +83,7 @@ def fmt_lev(val) -> str | None:
     return None
 
 def line(caption: str, value) -> str:
-    """Вернуть 'Ключ: Значение\\n' или пустую строку, если value пустое."""
+    """Вернуть 'Ключ: Значение\n' или пустую строку, если value пустое."""
     return f"{caption}: {value}\n" if value not in (None, "", "—") else ""
 
 def notional(avg, size) -> Decimal | None:
