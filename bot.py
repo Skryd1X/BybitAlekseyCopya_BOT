@@ -245,16 +245,18 @@ async def queue_consumer(app:Application,http:HTTP):
                             pos = await coll_pos.find_one({"_id":sym})
                             deal_id = int((pos or {}).get("deal",0))
                             if deal_id:
-                                doc = await coll_deals.find_one({"deal":deal_id})
-                                if not doc:
-                                    # если по каким-то причинам не создали на open — создадим «на лету»
-                                    await coll_deals.insert_one({
+                                # создаём сделку безопасно (без гонок)
+                                await coll_deals.update_one(
+                                    {"deal":deal_id},
+                                    {"$setOnInsert":{
                                         "deal": deal_id, "symbol": sym, "side": (pos or {}).get("side",""),
                                         "start_ts": int(time.time()),
                                         "buy_qty": 0.0, "buy_val": 0.0,
                                         "sell_qty": 0.0, "sell_val": 0.0,
                                         "status": "open"
-                                    })
+                                    }},
+                                    upsert=True
+                                )
                                 incs={}
                                 if side=="Buy":
                                     incs={"buy_qty": float(qty), "buy_val": float(qty*price)}
@@ -308,16 +310,20 @@ async def on_position(app:Application,msg:dict):
                 "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
             }},upsert=True)
 
-            # создадим объект сделки
-            await coll_deals.insert_one({
-                "deal": int(deal_seq),
-                "symbol": symbol,
-                "side": side,
-                "start_ts": int(time.time()),
-                "buy_qty": 0.0, "buy_val": 0.0,
-                "sell_qty": 0.0, "sell_val": 0.0,
-                "status": "open"
-            })
+            # создадим объект сделки (без дублей)
+            await coll_deals.update_one(
+                {"deal": int(deal_seq)},
+                {"$setOnInsert":{
+                    "deal": int(deal_seq),
+                    "symbol": symbol,
+                    "side": side,
+                    "start_ts": int(time.time()),
+                    "buy_qty": 0.0, "buy_val": 0.0,
+                    "sell_qty": 0.0, "sell_val": 0.0,
+                    "status": "open"
+                }},
+                upsert=True
+            )
 
             nt_val, approx = notional_from_row(r)
             if nt_val is None:
