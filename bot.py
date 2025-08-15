@@ -16,7 +16,7 @@ MONGO_URI=os.getenv("MONGO_URI","")
 DB_NAME=os.getenv("DB_NAME","bybit_bot")
 BYBIT_SETTLE=os.getenv("BYBIT_SETTLE","USDT").upper()
 LOG_LEVEL=os.getenv("LOG_LEVEL","INFO").upper()
-STATS_TZ_HOURS=int(os.getenv("STATS_TZ_HOURS","3"))  # смещение для суточной статы (по умолчанию МСК)
+STATS_TZ_HOURS=int(os.getenv("STATS_TZ_HOURS","3"))  # МСК по умолчанию
 
 logging.basicConfig(level=getattr(logging,LOG_LEVEL,logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(message)s")
@@ -35,12 +35,12 @@ MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
 SUPPORT_URL="https://t.me/bexruz2281488"
 
-# Кэш цены для «≈ номинала»
+# Кэш цены из последнего исполнения — как запасной вариант для exit_price/номинала
 LAST_EXEC_PRICE: dict[str, Decimal] = {}
-# Буфер исполнений до появления deal_id (чтобы не терять покупки/продажи)
+# Буфер исполнений до появления deal_id
 PENDING_EXEC: dict[str, dict] = {}
 
-# ------------------ форматтеры ------------------
+# ───────────────────────── helpers/format ─────────────────────────
 
 def _to_decimal(val):
     if val is None or val == "":
@@ -99,27 +99,18 @@ def line(caption: str, value) -> str:
     return f"{caption}: {value}\n" if value not in (None, "", "—") else ""
 
 def notional_from_row(row: dict) -> tuple[Decimal | None, bool]:
-    """
-    (номинал, approx_flag). Приоритет:
-      1) positionValue
-      2) |size| * avgPrice
-      3) |size| * markPrice
-    """
     pv = _to_decimal(row.get("positionValue") or row.get("position_value"))
     if pv and pv > 0:
         return pv.quantize(Decimal("0.01"), rounding=ROUND_DOWN), False
-
     size = _to_decimal(row.get("size"))
     avg  = _to_decimal(row.get("avgPrice") or row.get("avg_price"))
     if size and avg and size != 0 and avg > 0:
         val = (abs(size) * avg).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         return val, True
-
     mark = _to_decimal(row.get("markPrice") or row.get("mark_price"))
     if size and mark and size != 0 and mark > 0:
         val = (abs(size) * mark).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         return val, True
-
     return None, False
 
 async def _wait_exec_notional(symbol: str, size: Decimal, tries: int = 5, delay: float = 0.2):
@@ -130,7 +121,16 @@ async def _wait_exec_notional(symbol: str, size: Decimal, tries: int = 5, delay:
         await asyncio.sleep(delay)
     return None
 
-# ------------------ UI ------------------
+def _avg_price(total_val: Decimal | None, total_qty: Decimal | None) -> Decimal | None:
+    tv, tq = _to_decimal(total_val), _to_decimal(total_qty)
+    if tv and tq and tq > 0:
+        return (tv / tq).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    return None
+
+def _deal_dir_from_side(side_str: str) -> str:
+    return "Long" if (side_str or "").upper() == "BUY" else "Short"
+
+# ───────────────────────── UI ─────────────────────────
 
 def kb(enabled: bool):
     t = "🔕 Отключить сигналы" if enabled else "🔔 Включить сигналы"
@@ -148,18 +148,17 @@ async def broadcast(app:Application, text:str):
         except Exception as e:
             logging.warning("Broadcast failed: %s", e)
 
-# === WS callbacks ===
+# WS → очередь
 def _put_from_thread(item):
     if MAIN_LOOP is None:
         logging.error("MAIN_LOOP is not set, drop WS message")
         return
     MAIN_LOOP.call_soon_threadsafe(msg_queue.put_nowait, item)
-
 def ws_pos(msg):  _put_from_thread(("position", msg))
 def ws_order(msg): _put_from_thread(("order", msg))
 def ws_exec(msg): _put_from_thread(("execution", msg))
 
-# ------------------ telegram ------------------
+# ───────────────────────── telegram ─────────────────────────
 
 async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -187,17 +186,21 @@ async def on_toggle(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=kb(True))
         await q.message.reply_text("Сигналы включены. Буду присылать уведомления о сделках мастера.", reply_markup=kb(True))
 
-# ======= НОВОЕ: суточная статистика закрытых сделок =======
+# ───────────── суточная статистика (как в примере) ─────────────
 
 def _fmt_price_usdt(p: Decimal | None) -> str:
     s = fmt_price(p)
     return f"{s} USDT" if s else "—"
 
-def _deal_dir(side_str: str) -> str:
-    return "Long" if (side_str or "").upper() == "BUY" else "Short"
+def _calc_pnl_by_prices(dir_: str, entry_price: Decimal | None, exit_price: Decimal | None,
+                        qty: Decimal | None, fees: Decimal | None) -> Decimal | None:
+    e, x, q, f = _to_decimal(entry_price), _to_decimal(exit_price), _to_decimal(qty), (_to_decimal(fees) or Decimal("0"))
+    if e and x and q and q > 0:
+        pnl = (x - e) * q if dir_ == "Long" else (e - x) * q
+        return (pnl - f).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return None
 
 async def _build_daily_stats_text(tz_hours: int = 3) -> str:
-    """Сводка закрытых сделок за текущие сутки локального дня (по tz_hours)."""
     tz = dt_tz(timedelta(hours=tz_hours))
     now_local = datetime.now(tz)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -218,36 +221,44 @@ async def _build_daily_stats_text(tz_hours: int = 3) -> str:
     total_pnl = Decimal("0")
     idx = 0
     for d in deals:
+        idx += 1
         symbol = d.get("symbol","UNKNOWN")
-        dir_   = _deal_dir(d.get("side",""))
+        side_open = d.get("side","")
+        dir_ = _deal_dir_from_side(side_open)
+
         buy_q  = _to_decimal(d.get("buy_qty",0))  or Decimal("0")
         sell_q = _to_decimal(d.get("sell_qty",0)) or Decimal("0")
         buy_v  = _to_decimal(d.get("buy_val",0))  or Decimal("0")
         sell_v = _to_decimal(d.get("sell_val",0)) or Decimal("0")
         fees   = _to_decimal(d.get("fees",0))     or Decimal("0")
-        pnl    = _to_decimal(d.get("pnl")) if d.get("pnl") is not None else (sell_v - buy_v - fees)
-        pnl    = (pnl or Decimal("0")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        entry_price = _to_decimal(d.get("entry_price"))
+        entry_qty   = _to_decimal(d.get("entry_qty"))
+
+        # средние цены по фактическим ногам
+        avg_buy  = _avg_price(buy_v, buy_q)
+        avg_sell = _avg_price(sell_v, sell_q)
+
+        if dir_ == "Long":
+            final_entry = entry_price or avg_buy  # что знаем про вход
+            final_exit  = avg_sell or LAST_EXEC_PRICE.get(symbol)
+            closed_qty  = sell_q or entry_qty
+        else:  # Short
+            final_entry = entry_price or avg_sell
+            final_exit  = avg_buy or LAST_EXEC_PRICE.get(symbol)
+            closed_qty  = buy_q or entry_qty
+
+        pnl = _to_decimal(d.get("pnl"))
+        if pnl is None:
+            pnl = _calc_pnl_by_prices(dir_, final_entry, final_exit, closed_qty, fees) or Decimal("0")
         total_pnl += pnl
 
-        # объём и цены входа/выхода
-        if dir_ == "Long":
-            size = buy_q if buy_q > 0 else sell_q
-            entry = (buy_v / buy_q) if buy_q > 0 else None
-            exitp = (sell_v / sell_q) if sell_q > 0 else None
-            type_str = "Buy (лонг)"
-        else:
-            size = sell_q if sell_q > 0 else buy_q
-            entry = (sell_v / sell_q) if sell_q > 0 else None
-            exitp = (buy_v / buy_q) if buy_q > 0 else None
-            type_str = "Sell (шорт)"
-
-        idx += 1
+        type_str = "Buy (лонг)" if dir_=="Long" else "Sell (шорт)"
         lines += [
             f"{idx} {symbol}",
             f"• Тип: {type_str}",
-            f"• Кол-во: {fmt_qty(size)}",
-            f"• Цена входа: {_fmt_price_usdt(entry)}",
-            f"• Цена выхода: {_fmt_price_usdt(exitp)}",
+            f"• Кол-во: {fmt_qty(closed_qty)}",
+            f"• Цена входа: {_fmt_price_usdt(final_entry)}",
+            f"• Цена выхода: {_fmt_price_usdt(final_exit)}",
             f"• {'Прибыль' if pnl>=0 else 'Убыток'} (PnL): {fmt_usd_signed(pnl)}",
             ""
         ]
@@ -260,17 +271,14 @@ async def _build_daily_stats_text(tz_hours: int = 3) -> str:
     return "\n".join(lines)
 
 async def on_stats(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    """Кнопка 📊 — суточная сводка закрытых сделок (локальный день)."""
     q = update.callback_query
     await q.answer()
     text = await _build_daily_stats_text(STATS_TZ_HOURS)
-    # отправляем отдельным сообщением (не редактируем старое), чтобы не ломать клавиатуру
     await q.message.reply_text(text, reply_markup=kb(True))
 
-# ------------------ helpers ------------------
+# ───────────────────────── internal helpers ─────────────────────────
 
 async def _apply_pending_to_deal(symbol:str, deal_id:int):
-    """Слить буфер PENDING_EXEC[symbol] в сделку deal_id (если что-то есть)."""
     buf = PENDING_EXEC.pop(symbol, None)
     if not buf:
         return
@@ -282,7 +290,7 @@ async def _apply_pending_to_deal(symbol:str, deal_id:int):
     if incs:
         await coll_deals.update_one({"deal":deal_id},{"$inc":incs})
 
-# ------------------ обработка очереди ------------------
+# ───────────────────────── queue consumer ─────────────────────────
 
 async def queue_consumer(app:Application,http:HTTP):
     logging.info("Queue consumer started")
@@ -303,25 +311,22 @@ async def queue_consumer(app:Application,http:HTTP):
                         price = (_to_decimal(r.get("execPrice")) or
                                  _to_decimal(r.get("orderPrice")) or
                                  _to_decimal(r.get("price")))
-                        value = _to_decimal(r.get("execValue"))   # USDT
+                        value = _to_decimal(r.get("execValue"))
                         fee   = _to_decimal(r.get("execFee")) or Decimal("0")
                         qty   = _to_decimal(r.get("execQty"))
-                        side  = str(r.get("side","")).title()     # 'Buy'/'Sell'
+                        side  = str(r.get("side","")).title()  # 'Buy'/'Sell'
 
                         if sym and price:
                             LAST_EXEC_PRICE[sym] = price
                         if value is None and qty and price:
                             value = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
                         if not (sym and value and value>0):
                             continue
 
-                        # пробуем привязать к открытой сделке
                         pos = await coll_pos.find_one({"_id":sym})
                         deal_id = int((pos or {}).get("deal",0))
 
                         if deal_id:
-                            # на всякий случай убедимся, что документ сделки есть
                             await coll_deals.update_one({"deal":deal_id},{"$setOnInsert":{
                                 "deal":deal_id,"symbol":sym,"side":(pos or {}).get("side",""),
                                 "start_ts":int(time.time()),
@@ -340,7 +345,6 @@ async def queue_consumer(app:Application,http:HTTP):
                             if incs:
                                 await coll_deals.update_one({"deal":deal_id},{"$inc":incs})
                         else:
-                            # ещё не знаем deal_id — копим в буфере
                             buf = PENDING_EXEC.setdefault(sym, {"buy_qty":Decimal("0"),"sell_qty":Decimal("0"),
                                                                 "buy_val":Decimal("0"),"sell_val":Decimal("0"),
                                                                 "fees":Decimal("0")})
@@ -360,15 +364,16 @@ async def queue_consumer(app:Application,http:HTTP):
         except Exception as e:
             logging.error("Queue consumer error: %s", e)
 
-# ------------------ события ------------------
+# ───────────────────────── events ─────────────────────────
 
 async def save_event(kind,symbol,side,size,avg,lev,deal_id,percent=None):
     doc={"_id":str(uuid.uuid4()),"t":int(time.time()),"kind":kind,"symbol":symbol,"side":side,
-         "size":float(_to_decimal(size) or 0),"avg":float(_to_decimal(avg) or 0),"leverage":str(lev),"deal":int(deal_id)}
+         "size":float(_to_decimal(size) or 0),"avg":float(_to_decimal(avg) or 0),
+         "leverage":str(lev),"deal":int(deal_id)}
     if percent is not None: doc["percent"]=float(_to_decimal(percent) or 0)
     await coll_ev.insert_one(doc)
 
-# ------------------ обработчик позиций ------------------
+# ───────────────────────── positions handler ─────────────────────────
 
 async def on_position(app:Application,msg:dict):
     global deal_seq
@@ -391,6 +396,7 @@ async def on_position(app:Application,msg:dict):
         opened      = (prev_size==0 and size!=0)
         closed_full = (prev_size!=0 and size==0)
         partial     = (prev_size!=0 and size!=0 and abs(size)<abs(prev_size))
+        increased   = (prev_size!=0 and size!=0 and abs(size)>abs(prev_size))
 
         if opened:
             deal_seq+=1
@@ -398,7 +404,6 @@ async def on_position(app:Application,msg:dict):
                 "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
             }},upsert=True)
 
-            # создаём сделку и вливаем буфер исполнений (если он был до появления deal_id)
             await coll_deals.update_one({"deal":int(deal_seq)},{"$setOnInsert":{
                 "deal": int(deal_seq),
                 "symbol": symbol,
@@ -407,6 +412,8 @@ async def on_position(app:Application,msg:dict):
                 "buy_qty": 0.0, "buy_val": 0.0,
                 "sell_qty": 0.0, "sell_val": 0.0,
                 "fees": 0.0,
+                "entry_price": float(avg) if avg else None,
+                "entry_qty": float(abs(size)) if size else None,
                 "status": "open"
             }},upsert=True)
             await _apply_pending_to_deal(symbol, int(deal_seq))
@@ -433,6 +440,14 @@ async def on_position(app:Application,msg:dict):
             await broadcast(app,txt)
             continue
 
+        if increased:
+            # усреднили/добрали — обновим среднюю входа и текущий размер
+            deal_id=int(prev.get("deal",deal_seq+1) or deal_seq+1)
+            await coll_deals.update_one({"deal":deal_id},{
+                "$set":{"entry_price":float(avg) if avg else None,
+                        "entry_qty":float(abs(size)) if size else None}
+            })
+
         if partial:
             left = (abs(size) / abs(prev_size)) if prev_size != 0 else Decimal("0")
             closed_pct = (Decimal("1") - left) * Decimal("100")
@@ -457,20 +472,35 @@ async def on_position(app:Application,msg:dict):
 
         if closed_full:
             deal_id=int(prev.get("deal",deal_seq+1) or deal_seq+1)
-
-            # перед финализацией доливаем возможный буфер
             await _apply_pending_to_deal(symbol, deal_id)
 
-            deal_doc = await coll_deals.find_one({"deal":deal_id})
-            pnl = Decimal("0")
-            if deal_doc:
-                buy_val  = _to_decimal(deal_doc.get("buy_val",0))  or Decimal("0")
-                sell_val = _to_decimal(deal_doc.get("sell_val",0)) or Decimal("0")
-                fees     = _to_decimal(deal_doc.get("fees",0))     or Decimal("0")
-                pnl = (sell_val - buy_val - fees).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-                await coll_deals.update_one({"deal":deal_id},{
-                    "$set":{"status":"closed","end_ts":int(time.time()),"pnl":float(pnl)}
-                })
+            d = await coll_deals.find_one({"deal":deal_id}) or {}
+            dir_ = _deal_dir_from_side(prev_side)
+            buy_q  = _to_decimal(d.get("buy_qty",0))  or Decimal("0")
+            sell_q = _to_decimal(d.get("sell_qty",0)) or Decimal("0")
+            buy_v  = _to_decimal(d.get("buy_val",0))  or Decimal("0")
+            sell_v = _to_decimal(d.get("sell_val",0)) or Decimal("0")
+            fees   = _to_decimal(d.get("fees",0))     or Decimal("0")
+            entry_price = _to_decimal(d.get("entry_price")) or _to_decimal(prev.get("avg"))
+
+            avg_buy  = _avg_price(buy_v, buy_q)
+            avg_sell = _avg_price(sell_v, sell_q)
+
+            if dir_=="Long":
+                exit_price = avg_sell or LAST_EXEC_PRICE.get(symbol)
+                closed_qty = sell_q or abs(_to_decimal(prev.get("size")) or 0)
+            else:
+                exit_price = avg_buy or LAST_EXEC_PRICE.get(symbol)
+                closed_qty = buy_q or abs(_to_decimal(prev.get("size")) or 0)
+
+            pnl = _calc_pnl_by_prices(dir_, entry_price, exit_price, closed_qty, fees) or Decimal("0")
+            await coll_deals.update_one({"deal":deal_id},{
+                "$set":{
+                    "status":"closed","end_ts":int(time.time()),
+                    "pnl":float(pnl),
+                    "exit_price": float(exit_price) if exit_price else None
+                }
+            })
 
             await coll_pos.update_one({"_id":symbol},{"$set":{
                 "size":0.0,"avg":0.0,"side":"","deal":deal_id,"lev":lev
@@ -486,12 +516,12 @@ async def on_position(app:Application,msg:dict):
             await broadcast(app,txt)
             continue
 
-        # просто апдейт
+        # обычное обновление позиции
         await coll_pos.update_one({"_id":symbol},{"$set":{
             "size":float(size),"avg":float(avg),"side":side,"lev":lev
         }},upsert=True)
 
-# ------------------ догрузка по символу ------------------
+# ───────────────────────── fetch symbol snapshot ─────────────────────────
 
 async def fetch_symbol_and_process(app:Application,http:HTTP,symbol:str):
     try:
@@ -514,7 +544,7 @@ async def fetch_symbol_and_process(app:Application,http:HTTP,symbol:str):
     except Exception as e:
         logging.warning("Fetch positions for %s failed: %s", symbol, e)
 
-# ------------------ lifecycle ------------------
+# ───────────────────────── lifecycle ─────────────────────────
 
 async def _init_deal_seq():
     global deal_seq
@@ -561,7 +591,7 @@ async def post_init(app:Application):
 
     await _init_deal_seq()
 
-    # стартовый снимок
+    # стартовый снимок активных позиций
     try:
         r=http.get_positions(category="linear", settleCoin=BYBIT_SETTLE)
         lst=r.get("result",{}).get("list",[]) or []
@@ -581,7 +611,10 @@ async def post_init(app:Application):
             }},upsert=True)
             await coll_deals.update_one({"deal":int(deal_seq)},{"$setOnInsert":{
                 "deal":int(deal_seq),"symbol":symbol,"side":side,"start_ts":int(time.time()),
-                "buy_qty":0.0,"buy_val":0.0,"sell_qty":0.0,"sell_val":0.0,"fees":0.0,"status":"open"
+                "buy_qty":0.0,"buy_val":0.0,"sell_qty":0.0,"sell_val":0.0,"fees":0.0,
+                "entry_price": float(avg) if avg else None,
+                "entry_qty": float(abs(size)) if size else None,
+                "status":"open"
             }},upsert=True)
             await save_event("detected",symbol,side,size,avg,lev,deal_seq)
             cnt+=1
