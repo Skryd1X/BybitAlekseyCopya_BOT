@@ -239,7 +239,7 @@ async def _build_daily_stats_text(tz_hours: int = 3) -> str:
         avg_sell = _avg_price(sell_v, sell_q)
 
         if dir_ == "Long":
-            final_entry = entry_price or avg_buy  # что знаем про вход
+            final_entry = entry_price or avg_buy
             final_exit  = avg_sell or LAST_EXEC_PRICE.get(symbol)
             closed_qty  = sell_q or entry_qty
         else:  # Short
@@ -247,9 +247,19 @@ async def _build_daily_stats_text(tz_hours: int = 3) -> str:
             final_exit  = avg_buy or LAST_EXEC_PRICE.get(symbol)
             closed_qty  = buy_q or entry_qty
 
-        pnl = _to_decimal(d.get("pnl"))
-        if pnl is None:
-            pnl = _calc_pnl_by_prices(dir_, final_entry, final_exit, closed_qty, fees) or Decimal("0")
+        stored_pnl = _to_decimal(d.get("pnl"))
+        calc_pnl   = _calc_pnl_by_prices(dir_, final_entry, final_exit, closed_qty, fees)
+
+        # если в базе нет PnL или он около нуля — используем рассчитанный
+        if stored_pnl is None or abs(stored_pnl) < Decimal("0.005"):
+            pnl = calc_pnl or Decimal("0")
+        else:
+            pnl = stored_pnl
+
+        # если смогли посчитать и заметно отличается — подправим запись
+        if calc_pnl is not None and (stored_pnl is None or abs(calc_pnl - stored_pnl) >= Decimal("0.01")):
+            await coll_deals.update_one({"deal": d.get("deal")}, {"$set": {"pnl": float(calc_pnl)}})
+
         total_pnl += pnl
 
         type_str = "Buy (лонг)" if dir_=="Long" else "Sell (шорт)"
@@ -493,25 +503,29 @@ async def on_position(app:Application,msg:dict):
                 exit_price = avg_buy or LAST_EXEC_PRICE.get(symbol)
                 closed_qty = buy_q or abs(_to_decimal(prev.get("size")) or 0)
 
-            pnl = _calc_pnl_by_prices(dir_, entry_price, exit_price, closed_qty, fees) or Decimal("0")
-            await coll_deals.update_one({"deal":deal_id},{
-                "$set":{
-                    "status":"closed","end_ts":int(time.time()),
-                    "pnl":float(pnl),
-                    "exit_price": float(exit_price) if exit_price else None
-                }
-            })
+            pnl_calc = _calc_pnl_by_prices(dir_, entry_price, exit_price, closed_qty, fees)
+
+            upd = {"status":"closed","end_ts":int(time.time())}
+            if pnl_calc is not None:
+                upd["pnl"] = float(pnl_calc)
+            if exit_price:
+                upd["exit_price"] = float(exit_price)
+            if entry_price and not d.get("entry_price"):
+                upd["entry_price"] = float(entry_price)
+            if closed_qty and not d.get("entry_qty"):
+                upd["entry_qty"] = float(closed_qty)
+
+            await coll_deals.update_one({"deal":deal_id},{"$set":upd})
 
             await coll_pos.update_one({"_id":symbol},{"$set":{
                 "size":0.0,"avg":0.0,"side":"","deal":deal_id,"lev":lev
             }},upsert=True)
 
-            pnl_line = line("PNL", fmt_usd_signed(pnl))
             txt=(f"Сделка №{deal_id}\n"
                  f"⬛ Полное закрытие позиции\n\n"
                  f"{prev_side} {symbol}\n"
                  f"Позиция закрыта полностью\n"
-                 f"{pnl_line}")
+                 f"{line('PNL', fmt_usd_signed(pnl_calc) if pnl_calc is not None else '—')}")
             await save_event("close",symbol,prev_side,Decimal("0"),avg,lev,deal_id)
             await broadcast(app,txt)
             continue
