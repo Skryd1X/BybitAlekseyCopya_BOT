@@ -5,6 +5,7 @@ from pybit.unified_trading import WebSocket, HTTP
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import ReturnDocument  # <— для атомарного инкремента
 
 load_dotenv()
 TOKEN=os.getenv("TELEGRAM_TOKEN","")
@@ -20,14 +21,16 @@ logging.basicConfig(level=getattr(logging,LOG_LEVEL,logging.INFO),
                     format="%(asctime)s | %(levelname)s | %(message)s")
 
 msg_queue:asyncio.Queue=asyncio.Queue()
-deal_seq=80000
+
+# стартовое значение только для первичной инициализации в БД
+DEAL_SEQ_SEED=80000
 
 db=None
 coll_pos=None
 coll_ev=None
 coll_cfg=None
 coll_subs=None
-coll_deals=None            # <— учёт сделок/PNL
+coll_deals=None
 
 MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
@@ -35,6 +38,18 @@ SUPPORT_URL="https://t.me/bexruz2281488"
 
 # кэш последних цен исполнений (для номинала-«фоллбэка»)
 LAST_EXEC_PRICE: dict[str, Decimal] = {}
+
+# ------------------ helpers ------------------
+
+async def next_deal_id() -> int:
+    """Атомарно получить следующий номер сделки (переживает рестарты)."""
+    doc = await coll_cfg.find_one_and_update(
+        {"_id":"deal_seq"},
+        {"$inc":{"val":1}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER
+    )
+    return int(doc["val"])
 
 # ------------------ форматтеры чисел ------------------
 
@@ -96,8 +111,7 @@ def line(caption: str, value) -> str:
 
 def notional_from_row(row: dict) -> tuple[Decimal | None, bool]:
     """
-    Возвращает (номинал, approx_flag).
-    Приоритет:
+    Возвращает (номинал, approx_flag). Приоритет:
       1) positionValue
       2) |size| * avgPrice
       3) |size| * markPrice
@@ -193,10 +207,9 @@ async def on_toggle(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Сигналы включены. Буду присылать уведомления о сделках мастера.", reply_markup=kb(True))
 
 async def on_stats(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    """Кнопка 📊 Статистика"""
+    """Кнопка 📊 Статистика (последние 10 закрытых сделок)"""
     q = update.callback_query
     await q.answer()
-    # последние 10 закрытых сделок
     cursor = coll_deals.find({"status":"closed"}).sort("end_ts",-1).limit(10)
     rows = await cursor.to_list(length=10)
     if not rows:
@@ -223,7 +236,6 @@ async def queue_consumer(app:Application,http:HTTP):
             if topic=="position":
                 await on_position(app,msg)
             elif topic=="execution":
-                # 1) обновим сделки/PNL из исполнений
                 try:
                     data = msg.get("data", [])
                     if isinstance(data, dict):
@@ -232,7 +244,6 @@ async def queue_consumer(app:Application,http:HTTP):
                     for r in data:
                         sym = r.get("symbol")
                         if sym: symbols.add(sym)
-                        # вытаскиваем цену и qty
                         price = (_to_decimal(r.get("execPrice")) or
                                  _to_decimal(r.get("orderPrice")) or
                                  _to_decimal(r.get("price")))
@@ -241,11 +252,10 @@ async def queue_consumer(app:Application,http:HTTP):
                         side  = str(r.get("side","")).title()  # 'Buy'/'Sell'
                         if sym and price and qty and qty>0:
                             LAST_EXEC_PRICE[sym] = price
-                            # найдём активный deal_id по символу
                             pos = await coll_pos.find_one({"_id":sym})
                             deal_id = int((pos or {}).get("deal",0))
                             if deal_id:
-                                # создаём сделку безопасно (без гонок)
+                                # создаём сделку безопасно, если её ещё нет
                                 await coll_deals.update_one(
                                     {"deal":deal_id},
                                     {"$setOnInsert":{
@@ -264,7 +274,6 @@ async def queue_consumer(app:Application,http:HTTP):
                                     incs={"sell_qty": float(qty), "sell_val": float(qty*price)}
                                 if incs:
                                     await coll_deals.update_one({"deal":deal_id},{"$inc":incs})
-                    # 2) как и раньше — подтянем позиции для символов
                     for s in symbols:
                         await fetch_symbol_and_process(app,http,s)
                 except Exception as e:
@@ -283,7 +292,6 @@ async def save_event(kind,symbol,side,size,avg,lev,deal_id,percent=None):
 # ------------------ основной обработчик позиций ------------------
 
 async def on_position(app:Application,msg:dict):
-    global deal_seq
     if "data" not in msg: return
     rows=msg.get("data",[])
     if isinstance(rows,dict): rows=[rows]
@@ -305,16 +313,15 @@ async def on_position(app:Application,msg:dict):
         partial     = (prev_size!=0 and size!=0 and abs(size)<abs(prev_size))
 
         if opened:
-            deal_seq+=1
+            deal_id = await next_deal_id()
             await coll_pos.update_one({"_id":symbol},{"$set":{
-                "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
+                "size":float(size),"avg":float(avg),"side":side,"deal":deal_id,"lev":lev
             }},upsert=True)
 
-            # создадим объект сделки (без дублей)
             await coll_deals.update_one(
-                {"deal": int(deal_seq)},
+                {"deal": deal_id},
                 {"$setOnInsert":{
-                    "deal": int(deal_seq),
+                    "deal": deal_id,
                     "symbol": symbol,
                     "side": side,
                     "start_ts": int(time.time()),
@@ -335,7 +342,7 @@ async def on_position(app:Application,msg:dict):
                 nt_str = f"≈ {nt_str}"
 
             txt = (
-                f"Сделка №{deal_seq}\n"
+                f"Сделка №{deal_id}\n"
                 f"🟢 Открытие позиции\n\n"
                 f"{side} {symbol}\n"
                 f"Размер: {fmt_qty(size)}\n"
@@ -343,7 +350,7 @@ async def on_position(app:Application,msg:dict):
                 f"{line('Средняя цена входа', fmt_price(avg))}"
                 f"{line('Номинал', nt_str)}"
             )
-            await save_event("open",symbol,side,size,avg,lev,deal_seq)
+            await save_event("open",symbol,side,size,avg,lev,deal_id)
             await broadcast(app,txt)
             continue
 
@@ -351,7 +358,7 @@ async def on_position(app:Application,msg:dict):
             left = (abs(size) / abs(prev_size)) if prev_size != 0 else Decimal("0")
             closed_pct = (Decimal("1") - left) * Decimal("100")
 
-            deal_id=int(prev.get("deal",deal_seq+1) or deal_seq+1)
+            deal_id=int(prev.get("deal",0)) or await next_deal_id()
             await coll_pos.update_one({"_id":symbol},{"$set":{
                 "size":float(size),"avg":float(avg),"side":side,"deal":deal_id,"lev":lev
             }},upsert=True)
@@ -370,9 +377,8 @@ async def on_position(app:Application,msg:dict):
             continue
 
         if closed_full:
-            deal_id=int(prev.get("deal",deal_seq+1) or deal_seq+1)
+            deal_id=int(prev.get("deal",0)) or await next_deal_id()
 
-            # финализируем сделку и считаем PnL
             deal_doc = await coll_deals.find_one({"deal":deal_id})
             pnl = Decimal("0")
             if deal_doc:
@@ -439,10 +445,13 @@ async def post_init(app:Application):
     coll_ev=db["events"]
     coll_cfg=db["config"]
     coll_subs=db["subscribers"]
-    coll_deals=db["deals"]           # <— коллекция сделок/PNL
+    coll_deals=db["deals"]
 
     await db.command("ping")
     logging.info("Mongo connected: db=%s", DB_NAME)
+
+    # инициализация счётчика сделок один раз
+    await coll_cfg.update_one({"_id":"deal_seq"},{"$setOnInsert":{"val":DEAL_SEQ_SEED}},upsert=True)
 
     bot=await app.bot.get_me()
     logging.info("Telegram bot authorized: @%s id=%s", bot.username, bot.id)
@@ -458,7 +467,7 @@ async def post_init(app:Application):
     await coll_deals.create_index("deal", unique=True)
     logging.info("Mongo indexes ready")
 
-    # стартовый снимок активных позиций по USDT-контрактам
+    # стартовый снимок активных позиций
     try:
         r=http.get_positions(category="linear", settleCoin=BYBIT_SETTLE)
         lst=r.get("result",{}).get("list",[]) or []
@@ -471,17 +480,15 @@ async def post_init(app:Application):
             avg=_to_decimal(x.get("avgPrice", x.get("avg_price","0") or "0")) or Decimal("0")
             side=str(x.get("side","")).upper()
             lev=str(x.get("leverage",""))
-            global deal_seq
-            deal_seq+=1
+            deal_id = await next_deal_id()
             await coll_pos.update_one({"_id":symbol},{"$set":{
-                "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
+                "size":float(size),"avg":float(avg),"side":side,"deal":deal_id,"lev":lev
             }},upsert=True)
-            # создадим «висящую» сделку для активной позиции
-            await coll_deals.update_one({"deal":int(deal_seq)},{"$setOnInsert":{
-                "deal":int(deal_seq),"symbol":symbol,"side":side,"start_ts":int(time.time()),
+            await coll_deals.update_one({"deal":deal_id},{"$setOnInsert":{
+                "deal":deal_id,"symbol":symbol,"side":side,"start_ts":int(time.time()),
                 "buy_qty":0.0,"buy_val":0.0,"sell_qty":0.0,"sell_val":0.0,"status":"open"
             }},upsert=True)
-            await save_event("detected",symbol,side,size,avg,lev,deal_seq)
+            await save_event("detected",symbol,side,size,avg,lev,deal_id)
             cnt+=1
         logging.info("HTTP bootstrap positions settle=%s count=%s", BYBIT_SETTLE, cnt)
     except Exception as e:
@@ -491,7 +498,7 @@ async def post_init(app:Application):
     consumer=asyncio.create_task(queue_consumer(app,http))
     app.bot_data["consumer_task"]=consumer
 
-    # приватный WS на unified v5
+    # приватный WS
     ws=WebSocket(channel_type="private",testnet=(NETWORK!="mainnet"),
                  api_key=BYBIT_KEY,api_secret=BYBIT_SECRET,domain="bybit")
     ws.position_stream(callback=ws_pos)
