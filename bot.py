@@ -1,5 +1,5 @@
 import os, asyncio, time, uuid, logging
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from dotenv import load_dotenv
 from pybit.unified_trading import WebSocket, HTTP
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -26,33 +26,74 @@ coll_pos=None
 coll_ev=None
 coll_cfg=None
 coll_subs=None
-MAIN_LOOP: asyncio.AbstractEventLoop | None = None   # <— главный event loop
+MAIN_LOOP: asyncio.AbstractEventLoop | None = None   # главный event loop
 
 SUPPORT_URL="https://t.me/bexruz2281488"
 
-def d2(x):
-    try: return Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    except: return Decimal("0.00")
+# ------------------ форматтеры чисел ------------------
 
-def d4(x):
-    try: return Decimal(str(x)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-    except: return Decimal("0.0000")
+def _to_decimal(val):
+    if val is None or val == "":
+        return None
+    try:
+        return Decimal(str(val))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
-def qf(x):
-    try: return f"{d4(x).normalize()}"
-    except: return str(x)
+def fmt_qty(val, max_dec: int = 6) -> str:
+    """Количество/размер без экспоненты и с обрезкой лишних нулей"""
+    d = _to_decimal(val)
+    if not d:
+        return "0"
+    s = f"{d.normalize():f}"  # убираем экспоненту
+    if "." in s:
+        i, f = s.split(".")
+        f = f.rstrip("0")[:max_dec]
+        s = i if not f else f"{i}.{f}"
+    return s
 
-def pf(x):
-    try: return f"{d2(x).normalize()}"
-    except: return str(x)
+def fmt_price(val) -> str | None:
+    """Цена с динамической точностью. None -> не выводим строку."""
+    d = _to_decimal(val)
+    if not d or d == 0:
+        return None
+    # динамическая точность: чем меньше цена, тем больше знаков
+    dec = 2 if d >= 1 else 4 if d >= Decimal("0.1") else 6
+    q = Decimal(10) ** -dec
+    return f"{d.quantize(q, rounding=ROUND_DOWN):f}"
 
-def usd(x):
-    try: return f"${d2(x).normalize()}"
-    except: return f"${x}"
+def fmt_usd(val) -> str | None:
+    d = _to_decimal(val)
+    if not d or d == 0:
+        return None
+    return f"${d:,.2f}".replace(",", " ")
 
-def notional(avg,size):
-    try: return Decimal(str(abs(size)))*Decimal(str(avg))
-    except: return Decimal("0")
+def fmt_pct(val) -> str:
+    d = _to_decimal(val) or Decimal("0")
+    return f"{d.quantize(Decimal('0.01'), rounding=ROUND_DOWN):f}"
+
+def fmt_lev(val) -> str | None:
+    """Плечо: xN, если N>0. Иначе скрываем."""
+    d = _to_decimal(val)
+    if d and d > 0:
+        try:
+            return f"x{int(d)}"
+        except Exception:
+            return f"x{d.normalize():f}"
+    return None
+
+def line(caption: str, value) -> str:
+    """Вернуть 'Ключ: Значение\\n' или пустую строку, если value пустое."""
+    return f"{caption}: {value}\n" if value not in (None, "", "—") else ""
+
+def notional(avg, size) -> Decimal | None:
+    a = _to_decimal(avg)
+    q = _to_decimal(size)
+    if a and q and a > 0 and q != 0:
+        return (a * abs(q)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return None
+
+# ------------------ UI ------------------
 
 def kb(enabled: bool):
     t = "🔕 Отключить сигналы" if enabled else "🔔 Включить сигналы"
@@ -74,7 +115,6 @@ def _put_from_thread(item):
     if MAIN_LOOP is None:
         logging.error("MAIN_LOOP is not set, drop WS message")
         return
-    # планируем put_nowait в главный луп потокобезопасно
     MAIN_LOOP.call_soon_threadsafe(msg_queue.put_nowait, item)
 
 def ws_pos(msg):
@@ -88,6 +128,8 @@ def ws_order(msg):
 def ws_exec(msg):
     logging.debug("WS execution: %s", msg)
     _put_from_thread(("execution", msg))
+
+# ------------------ telegram ------------------
 
 async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -115,6 +157,8 @@ async def on_toggle(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(reply_markup=kb(True))
         await q.message.reply_text("Сигналы включены. Буду присылать уведомления о сделках мастера.", reply_markup=kb(True))
 
+# ------------------ обработка очереди ------------------
+
 async def queue_consumer(app:Application,http:HTTP):
     logging.info("Queue consumer started")
     while True:
@@ -138,11 +182,15 @@ async def queue_consumer(app:Application,http:HTTP):
         except Exception as e:
             logging.error("Queue consumer error: %s", e)
 
+# ------------------ хранилище событий ------------------
+
 async def save_event(kind,symbol,side,size,avg,lev,deal_id,percent=None):
     doc={"_id":str(uuid.uuid4()),"t":int(time.time()),"kind":kind,"symbol":symbol,"side":side,
-         "size":float(size),"avg":float(avg),"leverage":str(lev),"deal":int(deal_id)}
-    if percent is not None: doc["percent"]=float(percent)
+         "size":float(_to_decimal(size) or 0),"avg":float(_to_decimal(avg) or 0),"leverage":str(lev),"deal":int(deal_id)}
+    if percent is not None: doc["percent"]=float(_to_decimal(percent) or 0)
     await coll_ev.insert_one(doc)
+
+# ------------------ основной обработчик позиций ------------------
 
 async def on_position(app:Application,msg:dict):
     global deal_seq
@@ -153,50 +201,62 @@ async def on_position(app:Application,msg:dict):
         symbol=r.get("symbol")
         if not symbol: continue
         side=str(r.get("side","")).upper()
-        try: size=Decimal(r.get("size","0"))
-        except: size=Decimal("0")
-        try: avg=Decimal(r.get("avgPrice",r.get("avg_price","0") or "0"))
-        except: avg=Decimal("0")
-        lev=str(r.get("leverage",r.get("leverageEr","—")))
+
+        size = _to_decimal(r.get("size","0")) or Decimal("0")
+        avg  = _to_decimal(r.get("avgPrice", r.get("avg_price","0") or "0")) or Decimal("0")
+        lev  = str(r.get("leverage", r.get("leverageEr","")))
+
         prev=await coll_pos.find_one({"_id":symbol}) or {"size":0.0,"avg":0.0,"side":"","deal":0}
-        prev_size=Decimal(str(prev.get("size",0.0)))
+        prev_size=_to_decimal(prev.get("size",0.0)) or Decimal("0")
         prev_side=str(prev.get("side",""))
-        opened=(prev_size==0 and size!=0)
-        closed_full=(prev_size!=0 and size==0)
-        partial=(prev_size!=0 and size!=0 and abs(size)<abs(prev_size))
+
+        opened      = (prev_size==0 and size!=0)
+        closed_full = (prev_size!=0 and size==0)
+        partial     = (prev_size!=0 and size!=0 and abs(size)<abs(prev_size))
+
         if opened:
             deal_seq+=1
             await coll_pos.update_one({"_id":symbol},{"$set":{
                 "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
             }},upsert=True)
-            nt=notional(avg,size)
-            txt=(f"Сделка №{deal_seq}\n"
-                 f"🟢 Открытие позиции\n\n"
-                 f"{side} {symbol}\n"
-                 f"Размер: {qf(size)}\n"
-                 f"Плечо: x{lev}\n"
-                 f"Средняя цена входа: {pf(avg)}\n"
-                 f"Нотионал: {usd(nt)}")
+
+            nt = notional(avg, size)
+
+            txt = (
+                f"Сделка №{deal_seq}\n"
+                f"🟢 Открытие позиции\n\n"
+                f"{side} {symbol}\n"
+                f"Размер: {fmt_qty(size)}\n"
+                f"{line('Плечо', fmt_lev(lev))}"
+                f"{line('Средняя цена входа', fmt_price(avg))}"
+                f"{line('Номинал', fmt_usd(nt))}"
+            )
             await save_event("open",symbol,side,size,avg,lev,deal_seq)
             await broadcast(app,txt)
             continue
+
         if partial:
-            left=float(abs(size))/float(abs(prev_size)) if prev_size!=0 else 0.0
-            closed=(1.0-left)*100.0
+            left = (abs(size) / abs(prev_size)) if prev_size != 0 else Decimal("0")
+            closed_pct = (Decimal("1") - left) * Decimal("100")
+
             deal_id=int(prev.get("deal",deal_seq+1) or deal_seq+1)
             await coll_pos.update_one({"_id":symbol},{"$set":{
                 "size":float(size),"avg":float(avg),"side":side,"deal":deal_id,"lev":lev
             }},upsert=True)
-            txt=(f"Сделка №{deal_id}\n"
-                 f"🟧 Частичное закрытие\n\n"
-                 f"{side} {symbol}\n"
-                 f"Закрыто: {pf(closed)}%\n"
-                 f"Осталось: {qf(size)}\n"
-                 f"Средняя цена входа: {pf(avg)}\n"
-                 f"Плечо: x{lev}")
-            await save_event("partial",symbol,side,size,avg,lev,deal_id,percent=closed)
+
+            txt = (
+                f"Сделка №{deal_id}\n"
+                f"🟧 Частичное закрытие\n\n"
+                f"{side} {symbol}\n"
+                f"Закрыто: {fmt_pct(closed_pct)}%\n"
+                f"Осталось: {fmt_qty(size)}\n"
+                f"{line('Средняя цена входа', fmt_price(avg))}"
+                f"{line('Плечо', fmt_lev(lev))}"
+            )
+            await save_event("partial",symbol,side,size,avg,lev,deal_id,percent=closed_pct)
             await broadcast(app,txt)
             continue
+
         if closed_full:
             deal_id=int(prev.get("deal",deal_seq+1) or deal_seq+1)
             await coll_pos.update_one({"_id":symbol},{"$set":{
@@ -209,10 +269,13 @@ async def on_position(app:Application,msg:dict):
             await save_event("close",symbol,prev_side,Decimal("0"),avg,lev,deal_id)
             await broadcast(app,txt)
             continue
+
         # просто обновление полей
         await coll_pos.update_one({"_id":symbol},{"$set":{
             "size":float(size),"avg":float(avg),"side":side,"lev":lev
         }},upsert=True)
+
+# ------------------ догрузка среза по символу ------------------
 
 async def fetch_symbol_and_process(app:Application,http:HTTP,symbol:str):
     try:
@@ -233,10 +296,13 @@ async def fetch_symbol_and_process(app:Application,http:HTTP,symbol:str):
     except Exception as e:
         logging.warning("Fetch positions for %s failed: %s", symbol, e)
 
+# ------------------ жизненный цикл приложения ------------------
+
 async def post_init(app:Application):
     global MAIN_LOOP
-    MAIN_LOOP = asyncio.get_running_loop()  # <— сохраняем главный event loop
+    MAIN_LOOP = asyncio.get_running_loop()
     logging.info("Starting post_init...")
+
     client=AsyncIOMotorClient(MONGO_URI,uuidRepresentation="standard")
     global db, coll_pos, coll_ev, coll_cfg, coll_subs
     db=client[DB_NAME]
@@ -267,11 +333,11 @@ async def post_init(app:Application):
         for x in lst:
             symbol=x.get("symbol")
             if not symbol: continue
-            size=Decimal(str(x.get("size","0")))
+            size=_to_decimal(x.get("size","0")) or Decimal("0")
             if size==0: continue
-            avg=Decimal(str(x.get("avgPrice",x.get("avg_price","0") or "0")))
+            avg=_to_decimal(x.get("avgPrice", x.get("avg_price","0") or "0")) or Decimal("0")
             side=str(x.get("side","")).upper()
-            lev=str(x.get("leverage","—"))
+            lev=str(x.get("leverage",""))
             global deal_seq
             deal_seq+=1
             await coll_pos.update_one({"_id":symbol},{"$set":{
@@ -290,7 +356,6 @@ async def post_init(app:Application):
     # приватный WS на unified v5
     ws=WebSocket(channel_type="private",testnet=(NETWORK!="mainnet"),
                  api_key=BYBIT_KEY,api_secret=BYBIT_SECRET,domain="bybit")
-    # подписки
     ws.position_stream(callback=ws_pos)
     ws.order_stream(callback=ws_order)
     ws.execution_stream(callback=ws_exec)
