@@ -27,14 +27,16 @@ coll_pos=None
 coll_ev=None
 coll_cfg=None
 coll_subs=None
-coll_deals=None            # учёт сделок/PNL
+coll_deals=None
 
 MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
 SUPPORT_URL="https://t.me/bexruz2281488"
 
-# кэш последней цены исполнения (для оценки номинала при фоллбэке)
+# Кэш цены для «≈ номинала»
 LAST_EXEC_PRICE: dict[str, Decimal] = {}
+# Буфер исполнений до появления deal_id (чтобы не терять покупки/продажи)
+PENDING_EXEC: dict[str, dict] = {}
 
 # ------------------ форматтеры ------------------
 
@@ -144,24 +146,16 @@ async def broadcast(app:Application, text:str):
         except Exception as e:
             logging.warning("Broadcast failed: %s", e)
 
-# === WS callbacks (в другом потоке) ===
+# === WS callbacks ===
 def _put_from_thread(item):
     if MAIN_LOOP is None:
         logging.error("MAIN_LOOP is not set, drop WS message")
         return
     MAIN_LOOP.call_soon_threadsafe(msg_queue.put_nowait, item)
 
-def ws_pos(msg):
-    logging.debug("WS position: %s", msg)
-    _put_from_thread(("position", msg))
-
-def ws_order(msg):
-    logging.debug("WS order: %s", msg)
-    _put_from_thread(("order", msg))
-
-def ws_exec(msg):
-    logging.debug("WS execution: %s", msg)
-    _put_from_thread(("execution", msg))
+def ws_pos(msg):  _put_from_thread(("position", msg))
+def ws_order(msg): _put_from_thread(("order", msg))
+def ws_exec(msg): _put_from_thread(("execution", msg))
 
 # ------------------ telegram ------------------
 
@@ -192,7 +186,6 @@ async def on_toggle(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Сигналы включены. Буду присылать уведомления о сделках мастера.", reply_markup=kb(True))
 
 async def on_stats(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    """Кнопка 📊 Статистика"""
     q = update.callback_query
     await q.answer()
     cursor = coll_deals.find({"status":"closed"}).sort("end_ts",-1).limit(10)
@@ -200,16 +193,29 @@ async def on_stats(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not rows:
         await q.message.reply_text("Пока нет закрытых сделок.", reply_markup=kb(True))
         return
-    lines=[]
-    total=Decimal("0")
+    lines=[]; total=Decimal("0")
     for d in rows:
-        sym=d.get("symbol","?")
-        side=d.get("side","?")
+        sym=d.get("symbol","?"); side=d.get("side","?")
         pnl=_to_decimal(d.get("pnl",0)) or Decimal("0")
         total += pnl
         lines.append(f"{sym} / {side} / {fmt_usd_signed(pnl)}")
-    text = "📊 Последние сделки (до 10):\n" + "\n".join(lines) + "\n\n" + f"Итого PnL: {fmt_usd_signed(total)}"
-    await q.message.reply_text(text, reply_markup=kb(True))
+    await q.message.reply_text("📊 Последние сделки (до 10):\n" + "\n".join(lines) +
+                               f"\n\nИтого PnL: {fmt_usd_signed(total)}", reply_markup=kb(True))
+
+# ------------------ helpers ------------------
+
+async def _apply_pending_to_deal(symbol:str, deal_id:int):
+    """Слить буфер PENDING_EXEC[symbol] в сделку deal_id (если что-то есть)."""
+    buf = PENDING_EXEC.pop(symbol, None)
+    if not buf:
+        return
+    incs = {}
+    for k in ("buy_qty","sell_qty","buy_val","sell_val","fees"):
+        v = _to_decimal(buf.get(k))
+        if v and v != 0:
+            incs[k] = float(v)
+    if incs:
+        await coll_deals.update_one({"deal":deal_id},{"$inc":incs})
 
 # ------------------ обработка очереди ------------------
 
@@ -221,62 +227,67 @@ async def queue_consumer(app:Application,http:HTTP):
             if topic=="position":
                 await on_position(app,msg)
             elif topic=="execution":
-                # обновляем сделки по данным execution
                 try:
                     data = msg.get("data", [])
-                    if isinstance(data, dict):
-                        data = [data]
+                    if isinstance(data, dict): data = [data]
                     symbols=set()
                     for r in data:
                         sym = r.get("symbol")
                         if sym: symbols.add(sym)
 
-                        # Цена/сумма/комиссия из execution
                         price = (_to_decimal(r.get("execPrice")) or
                                  _to_decimal(r.get("orderPrice")) or
                                  _to_decimal(r.get("price")))
-                        value = _to_decimal(r.get("execValue"))  # USDT сумма сделки!
+                        value = _to_decimal(r.get("execValue"))   # USDT
                         fee   = _to_decimal(r.get("execFee")) or Decimal("0")
-                        qty   = _to_decimal(r.get("execQty"))   # только для инфо/кэша
-                        side  = str(r.get("side","")).title()   # 'Buy'/'Sell'
+                        qty   = _to_decimal(r.get("execQty"))
+                        side  = str(r.get("side","")).title()     # 'Buy'/'Sell'
 
                         if sym and price:
                             LAST_EXEC_PRICE[sym] = price
-                        # Если нет execValue (не должно, но на всякий случай) — считаем qty*price
                         if value is None and qty and price:
                             value = (qty * price).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-                        if sym and value and value>0:
-                            pos = await coll_pos.find_one({"_id":sym})
-                            deal_id = int((pos or {}).get("deal",0))
-                            if deal_id:
-                                # создаём/обновляем документ сделки; пишем через $setOnInsert, чтобы не ловить дубли
-                                await coll_deals.update_one(
-                                    {"deal":deal_id},
-                                    {"$setOnInsert":{
-                                        "deal": deal_id, "symbol": sym, "side": (pos or {}).get("side",""),
-                                        "start_ts": int(time.time()),
-                                        "buy_qty": 0.0, "buy_val": 0.0,
-                                        "sell_qty": 0.0, "sell_val": 0.0,
-                                        "fees": 0.0,
-                                        "status": "open"
-                                    }},
-                                    upsert=True
-                                )
-                                incs={}
-                                if side=="Buy":
-                                    incs={"buy_val": float(value)}
-                                    if qty: incs["buy_qty"]=float(qty)
-                                elif side=="Sell":
-                                    incs={"sell_val": float(value)}
-                                    if qty: incs["sell_qty"]=float(qty)
-                                # комиссии учитываем всегда
-                                if fee and fee>0:
-                                    incs["fees"]=float(fee)
-                                if incs:
-                                    await coll_deals.update_one({"deal":deal_id},{"$inc":incs})
+                        if not (sym and value and value>0):
+                            continue
 
-                    # подтянем позиции для задействованных символов (если не упираемся в 403)
+                        # пробуем привязать к открытой сделке
+                        pos = await coll_pos.find_one({"_id":sym})
+                        deal_id = int((pos or {}).get("deal",0))
+
+                        if deal_id:
+                            # на всякий случай убедимся, что документ сделки есть
+                            await coll_deals.update_one({"deal":deal_id},{"$setOnInsert":{
+                                "deal":deal_id,"symbol":sym,"side":(pos or {}).get("side",""),
+                                "start_ts":int(time.time()),
+                                "buy_qty":0.0,"buy_val":0.0,"sell_qty":0.0,"sell_val":0.0,
+                                "fees":0.0,"status":"open"
+                            }},upsert=True)
+                            incs={}
+                            if side=="Buy":
+                                incs={"buy_val": float(value)}
+                                if qty: incs["buy_qty"]=float(qty)
+                            elif side=="Sell":
+                                incs={"sell_val": float(value)}
+                                if qty: incs["sell_qty"]=float(qty)
+                            if fee and fee>0:
+                                incs["fees"]=float(fee)
+                            if incs:
+                                await coll_deals.update_one({"deal":deal_id},{"$inc":incs})
+                        else:
+                            # ещё не знаем deal_id — копим в буфере
+                            buf = PENDING_EXEC.setdefault(sym, {"buy_qty":Decimal("0"),"sell_qty":Decimal("0"),
+                                                                "buy_val":Decimal("0"),"sell_val":Decimal("0"),
+                                                                "fees":Decimal("0")})
+                            if side=="Buy":
+                                buf["buy_val"] += value
+                                if qty: buf["buy_qty"] += qty
+                            elif side=="Sell":
+                                buf["sell_val"] += value
+                                if qty: buf["sell_qty"] += qty
+                            if fee and fee>0:
+                                buf["fees"] += fee
+
                     for s in symbols:
                         await fetch_symbol_and_process(app,http,s)
                 except Exception as e:
@@ -284,7 +295,7 @@ async def queue_consumer(app:Application,http:HTTP):
         except Exception as e:
             logging.error("Queue consumer error: %s", e)
 
-# ------------------ хранилище событий ------------------
+# ------------------ события ------------------
 
 async def save_event(kind,symbol,side,size,avg,lev,deal_id,percent=None):
     doc={"_id":str(uuid.uuid4()),"t":int(time.time()),"kind":kind,"symbol":symbol,"side":side,
@@ -292,7 +303,7 @@ async def save_event(kind,symbol,side,size,avg,lev,deal_id,percent=None):
     if percent is not None: doc["percent"]=float(_to_decimal(percent) or 0)
     await coll_ev.insert_one(doc)
 
-# ------------------ основной обработчик позиций ------------------
+# ------------------ обработчик позиций ------------------
 
 async def on_position(app:Application,msg:dict):
     global deal_seq
@@ -322,7 +333,7 @@ async def on_position(app:Application,msg:dict):
                 "size":float(size),"avg":float(avg),"side":side,"deal":int(deal_seq),"lev":lev
             }},upsert=True)
 
-            # сделка: безопасная вставка через $setOnInsert
+            # создаём сделку и вливаем буфер исполнений (если он был до появления deal_id)
             await coll_deals.update_one({"deal":int(deal_seq)},{"$setOnInsert":{
                 "deal": int(deal_seq),
                 "symbol": symbol,
@@ -333,6 +344,7 @@ async def on_position(app:Application,msg:dict):
                 "fees": 0.0,
                 "status": "open"
             }},upsert=True)
+            await _apply_pending_to_deal(symbol, int(deal_seq))
 
             nt_val, approx = notional_from_row(r)
             if nt_val is None:
@@ -381,7 +393,9 @@ async def on_position(app:Application,msg:dict):
         if closed_full:
             deal_id=int(prev.get("deal",deal_seq+1) or deal_seq+1)
 
-            # финализируем сделку и считаем PnL = sell_val - buy_val - fees
+            # перед финализацией доливаем возможный буфер
+            await _apply_pending_to_deal(symbol, deal_id)
+
             deal_doc = await coll_deals.find_one({"deal":deal_id})
             pnl = Decimal("0")
             if deal_doc:
@@ -407,12 +421,12 @@ async def on_position(app:Application,msg:dict):
             await broadcast(app,txt)
             continue
 
-        # просто обновление полей
+        # просто апдейт
         await coll_pos.update_one({"_id":symbol},{"$set":{
             "size":float(size),"avg":float(avg),"side":side,"lev":lev
         }},upsert=True)
 
-# ------------------ догрузка среза по символу ------------------
+# ------------------ догрузка по символу ------------------
 
 async def fetch_symbol_and_process(app:Application,http:HTTP,symbol:str):
     try:
@@ -435,10 +449,9 @@ async def fetch_symbol_and_process(app:Application,http:HTTP,symbol:str):
     except Exception as e:
         logging.warning("Fetch positions for %s failed: %s", symbol, e)
 
-# ------------------ жизненный цикл приложения ------------------
+# ------------------ lifecycle ------------------
 
 async def _init_deal_seq():
-    """Подхватываем последний номер сделки из Mongo, чтобы нумерация не сбрасывалась."""
     global deal_seq
     try:
         last1 = await coll_deals.find().sort("deal",-1).limit(1).to_list(length=1)
@@ -474,7 +487,6 @@ async def post_init(app:Application):
     http=HTTP(testnet=(NETWORK!="mainnet"),api_key=BYBIT_KEY,api_secret=BYBIT_SECRET)
     logging.info("Bybit HTTP ready network=%s", NETWORK)
 
-    # индексы
     await coll_pos.create_index("side")
     await coll_ev.create_index([("t",1)])
     await coll_subs.create_index("chat_id", unique=True)
@@ -482,10 +494,9 @@ async def post_init(app:Application):
     await coll_deals.create_index("deal", unique=True)
     logging.info("Mongo indexes ready")
 
-    # подтянем последний номер сделки
     await _init_deal_seq()
 
-    # стартовый снимок активных позиций по USDT-контрактам
+    # стартовый снимок
     try:
         r=http.get_positions(category="linear", settleCoin=BYBIT_SETTLE)
         lst=r.get("result",{}).get("list",[]) or []
@@ -513,11 +524,9 @@ async def post_init(app:Application):
     except Exception as e:
         logging.warning("HTTP bootstrap failed: %s", e)
 
-    # консюмер очереди
     consumer=asyncio.create_task(queue_consumer(app,http))
     app.bot_data["consumer_task"]=consumer
 
-    # приватный WS на unified v5
     ws=WebSocket(channel_type="private",testnet=(NETWORK!="mainnet"),
                  api_key=BYBIT_KEY,api_secret=BYBIT_SECRET,domain="bybit")
     ws.position_stream(callback=ws_pos)
